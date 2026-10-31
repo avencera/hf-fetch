@@ -59,7 +59,8 @@ Rust and Python downloads of the same file wait for each other. Resuming relies
 on that lock, so do not share one cache between concurrent downloads on a
 filesystem where `flock` does not work, such as some NFS mounts. Unix
 snapshots use relative symlinks; other platforms use copies. Tokens are sent to
-the Hub and are not sent to redirected storage URLs.
+the Hub and are not sent to redirected storage URLs. Errors name storage URLs
+without their query, which holds the signature that grants access to the file.
 
 A cached branch or tag is used without checking whether it moved. Call
 `download()` to refresh it. Cached files can load without network access or a
@@ -75,7 +76,7 @@ only `default_hub_cache_dir()`, with no dependencies:
 
 ```toml
 [dependencies]
-hf-fetch = { version = "0.1.1", default-features = false }
+hf-fetch = { version = "0.1.2", default-features = false }
 ```
 
 For downloads, keep default features enabled. The crate uses edition 2024 and

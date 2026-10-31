@@ -82,7 +82,7 @@ dependencies = [
 
 [[package]]
 name = "hf-fetch"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "tempfile",
  "thiserror",
