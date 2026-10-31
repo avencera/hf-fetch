@@ -215,6 +215,9 @@ mod download {
                 .timeout_connect(Some(CONNECT_TIMEOUT))
                 .timeout_recv_response(Some(STALL_TIMEOUT))
                 .timeout_per_read(Some(STALL_TIMEOUT))
+                // a resumed range counts bytes of the file itself, not of a compressed copy,
+                // even when another crate turns on ureq's gzip feature
+                .accept_encoding("identity")
                 .user_agent(concat!(
                     env!("CARGO_PKG_NAME"),
                     "/",
@@ -346,8 +349,9 @@ mod download {
                     .map_err(io_error)
             };
 
-            // the blob's size, when the server says it, so a short answer is not published
-            let (response, size) = loop {
+            // where this answer's bytes should end and the blob's size, when the server says
+            // them, so a short answer is not published
+            let (response, end, size) = loop {
                 let (url, request) = self.blob_request(location);
                 let request = match offset {
                     0 => request,
@@ -363,19 +367,19 @@ mod download {
                         let size = header(&response, url, "content-length")
                             .ok()
                             .and_then(|length| length.parse().ok());
-                        break (response, size);
+                        break (response, size, size);
                     }
                     206 if offset > 0 => {
-                        let range = header(&response, url, "content-range")?;
-                        match content_range(&range) {
-                            Some((start, size)) if start == offset => break (response, Some(size)),
+                        let range = header(&response, url, "content-range").ok();
+                        match range.as_deref().and_then(content_range) {
+                            Some((start, end, size)) if start == offset => {
+                                break (response, Some(end + 1), Some(size));
+                            }
+                            // a range this download cannot check, such as one of unknown size,
+                            // starts over
                             _ => {
                                 restart(&mut file)?;
-                                return Err(HubError::InvalidHeader {
-                                    url: url.clone(),
-                                    header: "content-range",
-                                    value: range,
-                                });
+                                offset = 0;
                             }
                         }
                     }
@@ -397,14 +401,21 @@ mod download {
             // a failed read keeps the bytes already written for the next attempt
             io::copy(&mut response.into_body().into_reader(), &mut file).map_err(io_error)?;
             let written = file.stream_position().map_err(io_error)?;
-            if let Some(size) = size
-                && written != size
+            // a body past its range's end leaves bytes the blob does not have there
+            if let Some(end) = end
+                && written > end
             {
-                // a server may answer with less than the rest of the file, which the next
-                // attempt resumes, but more than the whole file means the partial file is bad
-                if written > size {
-                    restart(&mut file)?;
-                }
+                restart(&mut file)?;
+                return Err(io_error(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("received bytes past {end}"),
+                )));
+            }
+            // a server may answer with less than the rest of the file, which the next attempt
+            // resumes
+            if let Some(size) = size
+                && written < size
+            {
                 return Err(io_error(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
                     format!("received {written} of {size} bytes"),
@@ -660,11 +671,19 @@ mod download {
             })
     }
 
-    /// Start and total size of a `Content-Range` such as `bytes 3-6/7`
-    fn content_range(value: &str) -> Option<(u64, u64)> {
-        let (range, size) = value.strip_prefix("bytes ")?.split_once('/')?;
-        let (start, _) = range.split_once('-')?;
-        Some((start.parse().ok()?, size.parse().ok()?))
+    /// First byte, last byte and total size of a `Content-Range` such as `bytes 3-6/7`, when
+    /// all three are known and consistent
+    fn content_range(value: &str) -> Option<(u64, u64, u64)> {
+        let (unit, range) = value.trim().split_once(' ')?;
+        if !unit.eq_ignore_ascii_case("bytes") {
+            return None;
+        }
+
+        let (range, size) = range.split_once('/')?;
+        let (start, end) = range.split_once('-')?;
+        let [start, end, size] = [start, end, size].map(|number| number.trim().parse::<u64>());
+        let (start, end, size) = (start.ok()?, end.ok()?, size.ok()?);
+        (start <= end && end < size).then_some((start, end, size))
     }
 
     /// `scheme://host[:port]` of `url`
@@ -746,7 +765,8 @@ mod download {
         #[cfg(not(unix))]
         use super::write_into_place;
         use super::{
-            Hub, HubError, Path, clean_token, fs, is_blob_name, is_commit_hash, is_repo_file,
+            Hub, HubError, Path, clean_token, content_range, fs, is_blob_name, is_commit_hash,
+            is_repo_file,
         };
 
         const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
@@ -976,7 +996,7 @@ mod download {
         }
 
         #[test]
-        fn ignored_or_unsatisfiable_range_restarts_the_partial_file() {
+        fn unusable_range_answer_restarts_the_partial_file() {
             let ignoring = serve();
             let unsatisfiable = serve_with(|range| {
                 match range {
@@ -990,9 +1010,22 @@ mod download {
             }
             });
 
+            let unknown_size = serve_with(|range| {
+                match range {
+                None => format!(
+                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    BODY.len(),
+                    String::from_utf8_lossy(BODY)
+                ),
+                Some(_) => "HTTP/1.1 206 Partial Content\r\ncontent-range: bytes 5-6/*\r\ncontent-length: 2\r\nconnection: close\r\n\r\nts"
+                    .to_owned(),
+            }
+            });
+
             for ((origin, requests), expected) in [
                 (ignoring, vec![Some("bytes=5-".to_owned())]),
                 (unsatisfiable, vec![Some("bytes=5-".to_owned()), None]),
+                (unknown_size, vec![Some("bytes=5-".to_owned()), None]),
             ] {
                 let cache = tempfile::tempdir().unwrap();
                 let blobs = cache.path().join("models--owner--model/blobs");
@@ -1021,6 +1054,20 @@ mod download {
             assert!(is_blob_name("abc_123-DEF"));
             assert!(is_commit_hash(COMMIT));
             assert!(is_repo_file("nested/weights.bin"));
+        }
+
+        #[test]
+        fn content_range_needs_a_consistent_known_range() {
+            assert_eq!(content_range(" Bytes 3-6/7 "), Some((3, 6, 7)));
+            for value in [
+                "bytes 3-6/*",
+                "bytes 3-/7",
+                "bytes 3-2/7",
+                "bytes 3-7/7",
+                "items 3-6/7",
+            ] {
+                assert_eq!(content_range(value), None, "{value:?}");
+            }
         }
 
         #[test]
