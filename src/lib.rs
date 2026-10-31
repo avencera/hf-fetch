@@ -23,7 +23,8 @@
 //! The default `online` feature enables `Hub`, `HubRepo`, and `HubError`.
 //! Disable default features to use only [`default_hub_cache_dir`], with no dependencies.
 //! Connections time out after 30 seconds. Response headers and each body read time out
-//! after 60 seconds without progress. There is no whole-download time limit.
+//! after 60 seconds without progress. There is no whole-download time limit. A failed
+//! download keeps its partial file, and the next one resumes from it.
 //!
 //! Tokens stay on the Hub when it redirects to storage. Files use the Python cache's
 //! `models--owner--repo/{blobs,refs,snapshots}` layout, with relative symlinks on Unix
@@ -86,10 +87,9 @@ pub use download::{Hub, HubError, HubRepo};
 #[cfg(feature = "online")]
 mod download {
     use std::fs;
-    use std::io;
+    use std::io::{self, Seek, SeekFrom};
     use std::path::{Component, Path, PathBuf};
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::Duration;
 
     use ureq::http::Response;
     use ureq::typestate::WithoutBody;
@@ -215,6 +215,9 @@ mod download {
                 .timeout_connect(Some(CONNECT_TIMEOUT))
                 .timeout_recv_response(Some(STALL_TIMEOUT))
                 .timeout_per_read(Some(STALL_TIMEOUT))
+                // a resumed range counts bytes of the file itself, not of a compressed copy,
+                // even when another crate turns on ureq's gzip feature
+                .accept_encoding("identity")
                 .user_agent(concat!(
                     env!("CARGO_PKG_NAME"),
                     "/",
@@ -311,10 +314,124 @@ mod download {
             })
         }
 
-        /// Streams the file into `blob` through a temporary file, so an interrupted download
-        /// never leaves a partial blob behind
-        fn fetch(&self, location: &Download, blob: &Path) -> Result<(), HubError> {
-            let (url, request) = match location {
+        /// Streams the file into `blob` through `<blob>.incomplete`, which outlives a failed
+        /// attempt so the next one resumes where it stopped
+        ///
+        /// The lock at `lock` is the one `huggingface_hub` takes, so a Python download of the
+        /// same blob waits for this one. The partial file relies on that lock: on a filesystem
+        /// where `flock` silently succeeds, such as some NFS mounts, concurrent downloads of one
+        /// blob can append to the same partial file, as with hf-hub's `.part` files
+        fn fetch(&self, location: &Download, blob: &Path, lock: &Path) -> Result<(), HubError> {
+            let blobs = blob.parent().expect("blob paths sit in blobs/");
+            fs::create_dir_all(blobs).map_err(|error| HubError::io(blobs, error))?;
+            let _lock = lock_file(lock)?;
+            // another process may have finished the blob while this one waited for the lock
+            if blob.is_file() {
+                return Ok(());
+            }
+
+            let mut partial_name = blob.as_os_str().to_owned();
+            partial_name.push(".incomplete");
+            let partial = PathBuf::from(partial_name);
+            let io_error = |error| HubError::io(&partial, error);
+            // plain write access rather than append, which cannot truncate on Windows
+            let mut file = fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(false)
+                .open(&partial)
+                .map_err(io_error)?;
+            let mut offset = file.seek(SeekFrom::End(0)).map_err(io_error)?;
+            let restart = |file: &mut fs::File| {
+                file.set_len(0)
+                    .and_then(|()| file.seek(SeekFrom::Start(0)))
+                    .map(drop)
+                    .map_err(io_error)
+            };
+
+            // where this answer's bytes should end and the blob's size, when the server says
+            // them, so a short answer is not published
+            let (response, end, size) = loop {
+                let (url, request) = self.blob_request(location);
+                let request = match offset {
+                    0 => request,
+                    _ => request.header("Range", format!("bytes={offset}-")),
+                };
+                let response = call(request, url)?;
+                match response.status().as_u16() {
+                    200 => {
+                        // the server ignored the range and sent the whole file
+                        if offset > 0 {
+                            restart(&mut file)?;
+                        }
+                        let size = header(&response, url, "content-length")
+                            .ok()
+                            .and_then(|length| length.parse().ok());
+                        break (response, size, size);
+                    }
+                    206 if offset > 0 => {
+                        let range = header(&response, url, "content-range").ok();
+                        match range.as_deref().and_then(content_range) {
+                            Some((start, end, size)) if start == offset => {
+                                break (response, Some(end + 1), Some(size));
+                            }
+                            // a range this download cannot check, such as one of unknown size,
+                            // starts over
+                            _ => {
+                                restart(&mut file)?;
+                                offset = 0;
+                            }
+                        }
+                    }
+                    // the partial file is no prefix of the blob, such as a complete one whose
+                    // rename was interrupted, so it starts over
+                    416 if offset > 0 => {
+                        restart(&mut file)?;
+                        offset = 0;
+                    }
+                    status => {
+                        return Err(HubError::Status {
+                            status,
+                            url: url.clone(),
+                        });
+                    }
+                }
+            };
+
+            // a failed read keeps the bytes already written for the next attempt
+            io::copy(&mut response.into_body().into_reader(), &mut file).map_err(io_error)?;
+            let written = file.stream_position().map_err(io_error)?;
+            // a body past its range's end leaves bytes the blob does not have there
+            if let Some(end) = end
+                && written > end
+            {
+                restart(&mut file)?;
+                return Err(io_error(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("received bytes past {end}"),
+                )));
+            }
+            // a server may answer with less than the rest of the file, which the next attempt
+            // resumes
+            if let Some(size) = size
+                && written < size
+            {
+                return Err(io_error(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!("received {written} of {size} bytes"),
+                )));
+            }
+
+            drop(file);
+            fs::rename(&partial, blob).map_err(|error| HubError::io(blob, error))
+        }
+
+        /// A GET request for the bytes of a file
+        fn blob_request<'a>(
+            &self,
+            location: &'a Download,
+        ) -> (&'a String, RequestBuilder<WithoutBody>) {
+            match location {
                 Download::Hub(url) => (url, self.authorized(url)),
                 // storage URLs are presigned, so they get no token, and may redirect again
                 Download::Storage(url) => (
@@ -325,18 +442,7 @@ mod download {
                         .max_redirects(MAX_REDIRECTS as u32)
                         .build(),
                 ),
-            };
-            let response = call(request, url)?;
-            if !response.status().is_success() {
-                return Err(HubError::Status {
-                    status: response.status().as_u16(),
-                    url: url.clone(),
-                });
             }
-
-            let blobs = blob.parent().expect("blob paths sit in blobs/");
-            fs::create_dir_all(blobs).map_err(|error| HubError::io(blobs, error))?;
-            write_into_place(&mut response.into_body().into_reader(), blob)
         }
     }
 
@@ -428,7 +534,13 @@ mod download {
             let repo_dir = self.repo_dir();
             let blob = repo_dir.join("blobs").join(&metadata.etag);
             if !blob.is_file() {
-                self.hub.fetch(&metadata.location, &blob)?;
+                let lock = self
+                    .hub
+                    .cache_dir
+                    .join(".locks")
+                    .join(self.folder_name())
+                    .join(format!("{}.lock", metadata.etag));
+                self.hub.fetch(&metadata.location, &blob, &lock)?;
             }
 
             let snapshot_file = repo_dir.join("snapshots").join(&metadata.commit).join(file);
@@ -445,10 +557,28 @@ mod download {
         }
 
         fn repo_dir(&self) -> PathBuf {
-            self.hub
-                .cache_dir
-                .join(format!("models--{}", self.id.replace('/', "--")))
+            self.hub.cache_dir.join(self.folder_name())
         }
+
+        fn folder_name(&self) -> String {
+            format!("models--{}", self.id.replace('/', "--"))
+        }
+    }
+
+    /// Opens and exclusively locks the file at `path`, blocking while another process holds it
+    ///
+    /// The lock is released when the returned file closes, including when the process dies
+    fn lock_file(path: &Path) -> Result<fs::File, HubError> {
+        let locks = path.parent().expect("lock paths sit in .locks/<repo>/");
+        fs::create_dir_all(locks).map_err(|error| HubError::io(locks, error))?;
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(path)
+            .map_err(|error| HubError::io(path, error))?;
+        file.lock().map_err(|error| HubError::io(path, error))?;
+        Ok(file)
     }
 
     fn read_token() -> Result<Option<String>, HubError> {
@@ -474,7 +604,11 @@ mod download {
 
     /// Writes `reader` to a file of its own next to `dest`, then renames it into place, so
     /// readers never see a partial file and concurrent writers never share one
+    #[cfg(not(unix))]
     fn write_into_place(reader: &mut impl io::Read, dest: &Path) -> Result<(), HubError> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
         static NEXT: AtomicU64 = AtomicU64::new(0);
 
         let name = dest.file_name().expect("cache paths end in a file name");
@@ -535,6 +669,21 @@ mod download {
                 url: url.to_owned(),
                 header: name,
             })
+    }
+
+    /// First byte, last byte and total size of a `Content-Range` such as `bytes 3-6/7`, when
+    /// all three are known and consistent
+    fn content_range(value: &str) -> Option<(u64, u64, u64)> {
+        let (unit, range) = value.trim().split_once(' ')?;
+        if !unit.eq_ignore_ascii_case("bytes") {
+            return None;
+        }
+
+        let (range, size) = range.split_once('/')?;
+        let (start, end) = range.split_once('-')?;
+        let [start, end, size] = [start, end, size].map(|number| number.trim().parse::<u64>());
+        let (start, end, size) = (start.ok()?, end.ok()?, size.ok()?);
+        (start <= end && end < size).then_some((start, end, size))
     }
 
     /// `scheme://host[:port]` of `url`
@@ -613,20 +762,33 @@ mod download {
         use std::sync::{Arc, Mutex};
         use std::thread;
 
+        #[cfg(not(unix))]
+        use super::write_into_place;
         use super::{
-            Hub, HubError, Path, clean_token, fs, is_blob_name, is_commit_hash, is_repo_file,
-            write_into_place,
+            Hub, HubError, Path, clean_token, content_range, fs, is_blob_name, is_commit_hash,
+            is_repo_file,
         };
 
         const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
         const BODY: &[u8] = b"weights";
 
-        /// Path and `Authorization` header of each request the test server received
-        type Requests = Arc<Mutex<Vec<(String, Option<String>)>>>;
+        /// Path, `Authorization` and `Range` headers of each request the test server received
+        type Requests = Arc<Mutex<Vec<(String, Option<String>, Option<String>)>>>;
 
         /// Serves one repo file: the Hub answers with a redirect to storage, which serves
         /// the bytes, and every request's path and token are recorded
         fn serve() -> (String, Requests) {
+            serve_with(|_| {
+                format!(
+                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    BODY.len(),
+                    String::from_utf8_lossy(BODY)
+                )
+            })
+        }
+
+        /// Like [`serve`], with `answer` answering each storage request from its `Range`
+        fn serve_with(answer: fn(Option<&str>) -> String) -> (String, Requests) {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let origin = format!("http://{}", listener.local_addr().unwrap());
             let requests = Arc::new(Mutex::new(Vec::new()));
@@ -640,6 +802,7 @@ mod download {
                     reader.read_line(&mut line).unwrap();
                     let path = line.split_whitespace().nth(1).unwrap().to_owned();
                     let mut auth = None;
+                    let mut range = None;
                     loop {
                         let mut header = String::new();
                         reader.read_line(&mut header).unwrap();
@@ -649,15 +812,17 @@ mod download {
                         if let Some(value) = header.strip_prefix("authorization: ") {
                             auth = Some(value.trim().to_owned());
                         }
+                        if let Some(value) = header.strip_prefix("range: ") {
+                            range = Some(value.trim().to_owned());
+                        }
                     }
-                    recorded.lock().unwrap().push((path.clone(), auth));
+                    recorded
+                        .lock()
+                        .unwrap()
+                        .push((path.clone(), auth, range.clone()));
 
                     let response = if path.starts_with("/storage/") {
-                        format!(
-                            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                            BODY.len(),
-                            String::from_utf8_lossy(BODY)
-                        )
+                        answer(range.as_deref())
                     } else if path.starts_with("/old/") {
                         // a renamed repo redirects relative to the Hub
                         let renamed = path.replacen("/old/", "/owner/", 1);
@@ -714,7 +879,7 @@ mod download {
             );
 
             let requests = requests.lock().unwrap().clone();
-            let paths: Vec<_> = requests.iter().map(|(path, _)| path.as_str()).collect();
+            let paths: Vec<_> = requests.iter().map(|(path, ..)| path.as_str()).collect();
             assert_eq!(
                 paths,
                 [
@@ -729,8 +894,9 @@ mod download {
             assert_eq!(requests[2].1, None);
         }
 
+        #[cfg(not(unix))]
         #[test]
-        fn incomplete_download_preserves_the_old_blob() {
+        fn incomplete_copy_preserves_the_old_file() {
             struct Interrupted;
             impl std::io::Read for Interrupted {
                 fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
@@ -748,6 +914,134 @@ mod download {
             assert_eq!(fs::read_dir(cache.path()).unwrap().count(), 1);
         }
 
+        /// Storage requests' `Range` headers, in order
+        fn storage_ranges(requests: &Requests) -> Vec<Option<String>> {
+            let requests = requests.lock().unwrap();
+            requests
+                .iter()
+                .filter(|(path, ..)| path.starts_with("/storage/"))
+                .map(|(.., range)| range.clone())
+                .collect()
+        }
+
+        #[test]
+        fn interrupted_download_resumes_from_its_partial_file() {
+            let (origin, requests) = serve_with(|range| {
+                match range {
+                // the connection drops after three of the seven bytes
+                None => "HTTP/1.1 200 OK\r\ncontent-length: 7\r\nconnection: close\r\n\r\nwei"
+                    .to_owned(),
+                Some("bytes=3-") => "HTTP/1.1 206 Partial Content\r\ncontent-range: bytes 3-6/7\r\ncontent-length: 4\r\nconnection: close\r\n\r\nghts"
+                    .to_owned(),
+                Some(range) => panic!("unexpected range {range}"),
+            }
+            });
+            let cache = tempfile::tempdir().unwrap();
+            let repo = hub(&origin, cache.path()).model("owner/model", "main");
+            let repo_dir = cache.path().join("models--owner--model");
+
+            let interrupted = repo.get("model.bin");
+            assert!(matches!(interrupted, Err(HubError::Io { .. })));
+            assert_eq!(
+                fs::read(repo_dir.join("blobs/abc123.incomplete")).unwrap(),
+                b"wei"
+            );
+            assert!(!repo_dir.join("blobs/abc123").exists());
+
+            let path = repo.get("model.bin").unwrap();
+
+            assert_eq!(fs::read(path).unwrap(), BODY);
+            assert!(!repo_dir.join("blobs/abc123.incomplete").exists());
+            assert!(
+                cache
+                    .path()
+                    .join(".locks/models--owner--model/abc123.lock")
+                    .is_file()
+            );
+            assert_eq!(
+                storage_ranges(&requests),
+                [None, Some("bytes=3-".to_owned())]
+            );
+        }
+
+        #[test]
+        fn short_partial_answer_is_resumed_instead_of_published() {
+            let (origin, requests) = serve_with(|range| {
+                match range {
+                // a server may send less than the rest of the file
+                Some("bytes=3-") => "HTTP/1.1 206 Partial Content\r\ncontent-range: bytes 3-4/7\r\ncontent-length: 2\r\nconnection: close\r\n\r\ngh"
+                    .to_owned(),
+                Some("bytes=5-") => "HTTP/1.1 206 Partial Content\r\ncontent-range: bytes 5-6/7\r\ncontent-length: 2\r\nconnection: close\r\n\r\nts"
+                    .to_owned(),
+                range => panic!("unexpected range {range:?}"),
+            }
+            });
+            let cache = tempfile::tempdir().unwrap();
+            let blobs = cache.path().join("models--owner--model/blobs");
+            fs::create_dir_all(&blobs).unwrap();
+            fs::write(blobs.join("abc123.incomplete"), b"wei").unwrap();
+            let repo = hub(&origin, cache.path()).model("owner/model", "main");
+
+            let short = repo.get("model.bin");
+            assert!(matches!(short, Err(HubError::Io { .. })));
+            assert!(!blobs.join("abc123").exists());
+
+            let path = repo.get("model.bin").unwrap();
+
+            assert_eq!(fs::read(path).unwrap(), BODY);
+            assert_eq!(
+                storage_ranges(&requests),
+                [Some("bytes=3-".to_owned()), Some("bytes=5-".to_owned())]
+            );
+        }
+
+        #[test]
+        fn unusable_range_answer_restarts_the_partial_file() {
+            let ignoring = serve();
+            let unsatisfiable = serve_with(|range| {
+                match range {
+                None => format!(
+                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    BODY.len(),
+                    String::from_utf8_lossy(BODY)
+                ),
+                Some(_) => "HTTP/1.1 416 Range Not Satisfiable\r\ncontent-range: bytes */7\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                    .to_owned(),
+            }
+            });
+
+            let unknown_size = serve_with(|range| {
+                match range {
+                None => format!(
+                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    BODY.len(),
+                    String::from_utf8_lossy(BODY)
+                ),
+                Some(_) => "HTTP/1.1 206 Partial Content\r\ncontent-range: bytes 5-6/*\r\ncontent-length: 2\r\nconnection: close\r\n\r\nts"
+                    .to_owned(),
+            }
+            });
+
+            for ((origin, requests), expected) in [
+                (ignoring, vec![Some("bytes=5-".to_owned())]),
+                (unsatisfiable, vec![Some("bytes=5-".to_owned()), None]),
+                (unknown_size, vec![Some("bytes=5-".to_owned()), None]),
+            ] {
+                let cache = tempfile::tempdir().unwrap();
+                let blobs = cache.path().join("models--owner--model/blobs");
+                fs::create_dir_all(&blobs).unwrap();
+                fs::write(blobs.join("abc123.incomplete"), b"stale").unwrap();
+
+                let path = hub(&origin, cache.path())
+                    .model("owner/model", "main")
+                    .get("model.bin")
+                    .unwrap();
+
+                assert_eq!(fs::read(path).unwrap(), BODY);
+                assert_eq!(storage_ranges(&requests), expected);
+            }
+        }
+
         #[test]
         fn rejects_invalid_cache_names() {
             for name in ["", "..", "../outside", "a/b", "a\\b"] {
@@ -760,6 +1054,20 @@ mod download {
             assert!(is_blob_name("abc_123-DEF"));
             assert!(is_commit_hash(COMMIT));
             assert!(is_repo_file("nested/weights.bin"));
+        }
+
+        #[test]
+        fn content_range_needs_a_consistent_known_range() {
+            assert_eq!(content_range(" Bytes 3-6/7 "), Some((3, 6, 7)));
+            for value in [
+                "bytes 3-6/*",
+                "bytes 3-/7",
+                "bytes 3-2/7",
+                "bytes 3-7/7",
+                "items 3-6/7",
+            ] {
+                assert_eq!(content_range(value), None, "{value:?}");
+            }
         }
 
         #[test]

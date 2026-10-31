@@ -52,7 +52,12 @@ so large files can finish over a slow connection.
 ## Shared cache and scope
 
 Files use `models--owner--repo/blobs`, `refs`, and `snapshots`. Downloads stream
-through separate temporary files and move into place after completion. Unix
+into `<blob>.incomplete` and move into place after completion. A failed download
+keeps its partial file, and the next one resumes it with a `Range` request.
+Downloads take the same `.locks/` file lock as `huggingface_hub`, so concurrent
+Rust and Python downloads of the same file wait for each other. Resuming relies
+on that lock, so do not share one cache between concurrent downloads on a
+filesystem where `flock` does not work, such as some NFS mounts. Unix
 snapshots use relative symlinks; other platforms use copies. Tokens are sent to
 the Hub and are not sent to redirected storage URLs.
 
@@ -61,8 +66,8 @@ A cached branch or tag is used without checking whether it moved. Call
 token. Client construction still reads the configured token file.
 
 This crate downloads model files only. It does not provide uploads, repository
-management, dataset APIs, an async API, an Xet client, progress reporting, resume,
-or automatic retries. Large LFS and Xet-backed files use the Hub's HTTP storage
+management, dataset APIs, an async API, an Xet client, progress reporting, or
+automatic retries. Large LFS and Xet-backed files use the Hub's HTTP storage
 redirects.
 
 The default `online` feature enables downloads. Disable default features to use
@@ -70,7 +75,7 @@ only `default_hub_cache_dir()`, with no dependencies:
 
 ```toml
 [dependencies]
-hf-fetch = { version = "0.1.0", default-features = false }
+hf-fetch = { version = "0.1.1", default-features = false }
 ```
 
 For downloads, keep default features enabled. The crate uses edition 2024 and
