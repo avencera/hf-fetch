@@ -26,7 +26,8 @@
 //! after 60 seconds without progress. There is no whole-download time limit. A failed
 //! download keeps its partial file, and the next one resumes from it.
 //!
-//! Tokens stay on the Hub when it redirects to storage. Files use the Python cache's
+//! Tokens stay on the Hub when it redirects to storage, and errors leave out the signed
+//! query of storage URLs. Files use the Python cache's
 //! `models--owner--repo/{blobs,refs,snapshots}` layout, with relative symlinks on Unix
 //! and copies on other platforms. `HubRepo::get` uses cached files without a request;
 //! `HubRepo::download` refreshes metadata even if the file is already cached.
@@ -392,7 +393,7 @@ mod download {
                     status => {
                         return Err(HubError::Status {
                             status,
-                            url: url.clone(),
+                            url: url.to_owned(),
                         });
                     }
                 }
@@ -426,16 +427,18 @@ mod download {
             fs::rename(&partial, blob).map_err(|error| HubError::io(blob, error))
         }
 
-        /// A GET request for the bytes of a file
+        /// A GET request for the bytes of a file, and the URL its errors name
         fn blob_request<'a>(
             &self,
             location: &'a Download,
-        ) -> (&'a String, RequestBuilder<WithoutBody>) {
+        ) -> (&'a str, RequestBuilder<WithoutBody>) {
             match location {
                 Download::Hub(url) => (url, self.authorized(url)),
-                // storage URLs are presigned, so they get no token, and may redirect again
+                // storage URLs are presigned, so they get no token, and may redirect again.
+                // Their query is the signature that grants access, so errors, which reach logs
+                // and bug reports, leave it out
                 Download::Storage(url) => (
-                    url,
+                    url.split_once('?').map_or(url, |(base, _)| base),
                     self.agent
                         .get(url)
                         .config()
@@ -793,7 +796,7 @@ mod download {
             let origin = format!("http://{}", listener.local_addr().unwrap());
             let requests = Arc::new(Mutex::new(Vec::new()));
             let recorded = Arc::clone(&requests);
-            let storage = format!("{origin}/storage/blob");
+            let storage = format!("{origin}/storage/blob?signature=secret");
             thread::spawn(move || {
                 for stream in listener.incoming() {
                     let mut stream = stream.unwrap();
@@ -885,7 +888,7 @@ mod download {
                 [
                     "/old/model/resolve/main/nested/model.bin",
                     "/owner/model/resolve/main/nested/model.bin",
-                    "/storage/blob",
+                    "/storage/blob?signature=secret",
                 ]
             );
             let bearer = Some("Bearer secret".to_owned());
@@ -1113,6 +1116,22 @@ mod download {
             ));
             assert_eq!(requests.lock().unwrap().len(), 1);
             assert!(!cache.path().join("models--owner--model/snapshots").exists());
+        }
+
+        #[test]
+        fn storage_errors_leave_out_the_signature() {
+            let (origin, _) = serve_with(|_| {
+                "HTTP/1.1 403 Forbidden\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                    .to_owned()
+            });
+            let cache = tempfile::tempdir().unwrap();
+            let repo = hub(&origin, cache.path()).model("owner/model", "main");
+
+            let error = repo.get("model.bin").unwrap_err();
+
+            assert_eq!(error.status(), Some(403));
+            assert!(error.to_string().ends_with("/storage/blob"), "{error}");
+            assert!(!format!("{error:?}").contains("secret"), "{error:?}");
         }
 
         #[test]
