@@ -1,12 +1,11 @@
-//! Hugging Face Hub downloads into the standard hub cache
+//! A low-dependency, low-complexity, blocking downloader for Hugging Face Hub model files
+//!
+//! It exists because hf-hub 1.0 brings in tokio, reqwest and hf-xet, far more than fetching
+//! a few model files needs. This crate uses a small blocking `ureq` client with rustls, and
+//! has no async runtime or Xet client
 //!
 //! The endpoint, token and cache resolve the way `huggingface_hub` resolves them, so Python
-//! tools and this crate share one cache. Downloads use a small blocking `ureq` client instead
-//! of hf-hub 1.0, whose async stack (tokio, reqwest, hf-xet) is far more than fetching a few
-//! model files needs
-//!
-//! A low-dependency, low-complexity way to download model files from the Hub.
-//! Blocking only: no async runtime, model execution, or Xet client.
+//! tools and this crate share one cache
 //!
 //! ```no_run
 //! # #[cfg(feature = "online")]
@@ -92,8 +91,9 @@ mod download {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-    use ureq::Agent;
     use ureq::http::Response;
+    use ureq::typestate::WithoutBody;
+    use ureq::{Agent, Body, RequestBuilder};
 
     use super::{default_hub_cache_dir, env_path, env_var, hf_home};
 
@@ -222,10 +222,11 @@ mod download {
                 ))
                 .build()
                 .new_agent();
-            let endpoint = env_var("HF_ENDPOINT").map_or_else(
-                || DEFAULT_ENDPOINT.to_owned(),
-                |e| e.trim_end_matches('/').to_owned(),
-            );
+            let endpoint = env_var("HF_ENDPOINT")
+                .as_deref()
+                .unwrap_or(DEFAULT_ENDPOINT)
+                .trim_end_matches('/')
+                .to_owned();
 
             Ok(Self {
                 agent,
@@ -245,16 +246,13 @@ mod download {
             }
         }
 
-        fn get(&self, url: &str, with_token: bool) -> Result<Response<ureq::Body>, HubError> {
-            let mut request = self.agent.get(url);
-            if with_token && let Some(token) = &self.token {
-                request = request.header("Authorization", format!("Bearer {token}"));
+        /// A GET request for `url` that carries the token, for URLs on the Hub only
+        fn authorized(&self, url: &str) -> RequestBuilder<WithoutBody> {
+            let request = self.agent.get(url);
+            match &self.token {
+                Some(token) => request.header("Authorization", format!("Bearer {token}")),
+                None => request,
             }
-
-            request.call().map_err(|error| HubError::Request {
-                url: url.to_owned(),
-                error: Box::new(error),
-            })
         }
 
         /// Asks for the first byte of `url` to learn the file's commit and blob etag
@@ -264,15 +262,8 @@ mod download {
         fn metadata(&self, url: &str) -> Result<Metadata, HubError> {
             let mut current = url.to_owned();
             for _ in 0..=MAX_REDIRECTS {
-                let mut request = self.agent.get(&current).header("Range", "bytes=0-0");
-                if let Some(token) = &self.token {
-                    request = request.header("Authorization", format!("Bearer {token}"));
-                }
-
-                let response = request.call().map_err(|error| HubError::Request {
-                    url: current.clone(),
-                    error: Box::new(error),
-                })?;
+                let request = self.authorized(&current).header("Range", "bytes=0-0");
+                let response = call(request, &current)?;
                 let status = response.status();
                 let location = if status.is_redirection() {
                     let location = header(&response, &current, "location")?;
@@ -290,10 +281,8 @@ mod download {
                     });
                 };
 
-                let etag = match header(&response, &current, "x-linked-etag") {
-                    Ok(etag) => etag,
-                    Err(_) => header(&response, &current, "etag")?,
-                };
+                let etag = header(&response, &current, "x-linked-etag")
+                    .or_else(|_| header(&response, &current, "etag"))?;
                 // weak validators and quotes are not part of the blob name
                 let etag = etag.trim_start_matches("W/").replace('"', "");
                 let commit = header(&response, &current, "x-repo-commit")?;
@@ -325,25 +314,23 @@ mod download {
         /// Streams the file into `blob` through a temporary file, so an interrupted download
         /// never leaves a partial blob behind
         fn fetch(&self, location: &Download, blob: &Path) -> Result<(), HubError> {
-            let response = match location {
-                Download::Hub(url) => self.get(url, true)?,
+            let (url, request) = match location {
+                Download::Hub(url) => (url, self.authorized(url)),
                 // storage URLs are presigned, so they get no token, and may redirect again
-                Download::Storage(url) => self
-                    .agent
-                    .get(url)
-                    .config()
-                    .max_redirects(MAX_REDIRECTS as u32)
-                    .build()
-                    .call()
-                    .map_err(|error| HubError::Request {
-                        url: url.clone(),
-                        error: Box::new(error),
-                    })?,
+                Download::Storage(url) => (
+                    url,
+                    self.agent
+                        .get(url)
+                        .config()
+                        .max_redirects(MAX_REDIRECTS as u32)
+                        .build(),
+                ),
             };
+            let response = call(request, url)?;
             if !response.status().is_success() {
                 return Err(HubError::Status {
                     status: response.status().as_u16(),
-                    url: location.url().to_owned(),
+                    url: url.clone(),
                 });
             }
 
@@ -360,14 +347,6 @@ mod download {
         Hub(String),
         /// The Hub redirected to object storage, as it does for LFS and Xet files
         Storage(String),
-    }
-
-    impl Download {
-        fn url(&self) -> &str {
-            match self {
-                Self::Hub(url) | Self::Storage(url) => url,
-            }
-        }
     }
 
     #[derive(Debug)]
@@ -535,8 +514,15 @@ mod download {
         })
     }
 
+    fn call(request: RequestBuilder<WithoutBody>, url: &str) -> Result<Response<Body>, HubError> {
+        request.call().map_err(|error| HubError::Request {
+            url: url.to_owned(),
+            error: Box::new(error),
+        })
+    }
+
     fn header(
-        response: &Response<ureq::Body>,
+        response: &Response<Body>,
         url: &str,
         name: &'static str,
     ) -> Result<String, HubError> {
@@ -599,10 +585,7 @@ mod download {
         {
             // up from the file's directory to the snapshot, then out of snapshots/<commit>/
             let depth = Path::new(file).components().count() + 1;
-            let mut target = PathBuf::new();
-            for _ in 0..depth {
-                target.push("..");
-            }
+            let mut target: PathBuf = std::iter::repeat_n("..", depth).collect();
             target.push("blobs");
             target.push(blob.file_name().expect("blob paths end in the etag"));
 
