@@ -70,7 +70,7 @@ only `default_hub_cache_dir()`, with no dependencies:
 
 ```toml
 [dependencies]
-hf-fetch = { git = "https://github.com/avencera/hf-fetch", default-features = false }
+hf-fetch = { version = "0.1.0", default-features = false }
 ```
 
 For downloads, keep default features enabled. The crate uses edition 2024 and
