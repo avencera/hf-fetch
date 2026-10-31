@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request: {}
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  check:
+    name: Check (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: |
+          cargo clippy --locked --all-targets --all-features -- -D warnings
+          cargo clippy --locked --all-targets --no-default-features -- -D warnings
+      - name: Test
+        run: |
+          cargo test --locked --all-features
+          cargo test --locked --no-default-features
+      - name: Dependency scope
+        if: runner.os == 'Linux'
+        run: |
+          cargo tree --locked --all-features --target all -e normal,build --prefix none > dependencies.txt
+          if grep -E '^(tokio|reqwest|hf-xet|hf-hub) ' dependencies.txt; then exit 1; fi
+          test "$(cargo tree --locked --no-default-features -e normal,build --prefix none | wc -l)" -eq 1
+  cargo-deny:
+    name: Cargo deny
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      # use the prebuilt binary to avoid a Docker Hub build dependency
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny@0.20.2
+      - run: cargo deny --all-features check

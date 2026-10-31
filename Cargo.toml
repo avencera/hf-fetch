@@ -1,0 +1,29 @@
+[package]
+name = "hf-fetch"
+version = "0.1.0"
+edition = "2024"
+authors = ["Praveen Perera"]
+description = "Small blocking Hugging Face model downloader with a Python-compatible cache"
+license = "Apache-2.0"
+repository = "https://github.com/avencera/hf-fetch"
+documentation = "https://docs.rs/hf-fetch"
+readme = "README.md"
+keywords = ["huggingface", "hub", "download", "models", "cache"]
+categories = ["web-programming::http-client", "caching"]
+include = ["/src/**", "/tests/**", "/README.md", "/LICENSE", "/Cargo.toml"]
+
+[features]
+default = ["online"]
+online = ["dep:thiserror", "dep:ureq"]
+
+[dependencies]
+thiserror = { version = "2", optional = true }
+ureq = { version = "3.5.0", optional = true, default-features = false, features = ["rustls"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+[lints.clippy]
+enum_glob_use = "warn"
+wildcard_imports = "warn"
+redundant_closure_for_method_calls = "warn"
