@@ -87,7 +87,7 @@ pub use download::{Hub, HubError, HubRepo};
 #[cfg(feature = "online")]
 mod download {
     use std::fs;
-    use std::io;
+    use std::io::{self, Seek, SeekFrom};
     use std::path::{Component, Path, PathBuf};
     use std::time::Duration;
 
@@ -330,21 +330,24 @@ mod download {
             let mut partial_name = blob.as_os_str().to_owned();
             partial_name.push(".incomplete");
             let partial = PathBuf::from(partial_name);
+            let io_error = |error| HubError::io(&partial, error);
+            // plain write access rather than append, which cannot truncate on Windows
             let mut file = fs::OpenOptions::new()
                 .create(true)
-                .append(true)
+                .write(true)
+                .truncate(false)
                 .open(&partial)
-                .map_err(|error| HubError::io(&partial, error))?;
-            let mut offset = file
-                .metadata()
-                .map_err(|error| HubError::io(&partial, error))?
-                .len();
-            let restart = |file: &fs::File| {
+                .map_err(io_error)?;
+            let mut offset = file.seek(SeekFrom::End(0)).map_err(io_error)?;
+            let restart = |file: &mut fs::File| {
                 file.set_len(0)
-                    .map_err(|error| HubError::io(&partial, error))
+                    .and_then(|()| file.seek(SeekFrom::Start(0)))
+                    .map(drop)
+                    .map_err(io_error)
             };
 
-            let response = loop {
+            // the blob's size, when the server says it, so a short answer is not published
+            let (response, size) = loop {
                 let (url, request) = self.blob_request(location);
                 let request = match offset {
                     0 => request,
@@ -355,26 +358,31 @@ mod download {
                     200 => {
                         // the server ignored the range and sent the whole file
                         if offset > 0 {
-                            restart(&file)?;
+                            restart(&mut file)?;
                         }
-                        break response;
+                        let size = header(&response, url, "content-length")
+                            .ok()
+                            .and_then(|length| length.parse().ok());
+                        break (response, size);
                     }
                     206 if offset > 0 => {
                         let range = header(&response, url, "content-range")?;
-                        if !range.starts_with(&format!("bytes {offset}-")) {
-                            restart(&file)?;
-                            return Err(HubError::InvalidHeader {
-                                url: url.clone(),
-                                header: "content-range",
-                                value: range,
-                            });
+                        match content_range(&range) {
+                            Some((start, size)) if start == offset => break (response, Some(size)),
+                            _ => {
+                                restart(&mut file)?;
+                                return Err(HubError::InvalidHeader {
+                                    url: url.clone(),
+                                    header: "content-range",
+                                    value: range,
+                                });
+                            }
                         }
-                        break response;
                     }
                     // the partial file is no prefix of the blob, such as a complete one whose
                     // rename was interrupted, so it starts over
                     416 if offset > 0 => {
-                        restart(&file)?;
+                        restart(&mut file)?;
                         offset = 0;
                     }
                     status => {
@@ -387,8 +395,22 @@ mod download {
             };
 
             // a failed read keeps the bytes already written for the next attempt
-            io::copy(&mut response.into_body().into_reader(), &mut file)
-                .map_err(|error| HubError::io(&partial, error))?;
+            io::copy(&mut response.into_body().into_reader(), &mut file).map_err(io_error)?;
+            let written = file.stream_position().map_err(io_error)?;
+            if let Some(size) = size
+                && written != size
+            {
+                // a server may answer with less than the rest of the file, which the next
+                // attempt resumes, but more than the whole file means the partial file is bad
+                if written > size {
+                    restart(&mut file)?;
+                }
+                return Err(io_error(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!("received {written} of {size} bytes"),
+                )));
+            }
+
             drop(file);
             fs::rename(&partial, blob).map_err(|error| HubError::io(blob, error))
         }
@@ -636,6 +658,13 @@ mod download {
                 url: url.to_owned(),
                 header: name,
             })
+    }
+
+    /// Start and total size of a `Content-Range` such as `bytes 3-6/7`
+    fn content_range(value: &str) -> Option<(u64, u64)> {
+        let (range, size) = value.strip_prefix("bytes ")?.split_once('/')?;
+        let (start, _) = range.split_once('-')?;
+        Some((start.parse().ok()?, size.parse().ok()?))
     }
 
     /// `scheme://host[:port]` of `url`
@@ -912,6 +941,37 @@ mod download {
             assert_eq!(
                 storage_ranges(&requests),
                 [None, Some("bytes=3-".to_owned())]
+            );
+        }
+
+        #[test]
+        fn short_partial_answer_is_resumed_instead_of_published() {
+            let (origin, requests) = serve_with(|range| {
+                match range {
+                // a server may send less than the rest of the file
+                Some("bytes=3-") => "HTTP/1.1 206 Partial Content\r\ncontent-range: bytes 3-4/7\r\ncontent-length: 2\r\nconnection: close\r\n\r\ngh"
+                    .to_owned(),
+                Some("bytes=5-") => "HTTP/1.1 206 Partial Content\r\ncontent-range: bytes 5-6/7\r\ncontent-length: 2\r\nconnection: close\r\n\r\nts"
+                    .to_owned(),
+                range => panic!("unexpected range {range:?}"),
+            }
+            });
+            let cache = tempfile::tempdir().unwrap();
+            let blobs = cache.path().join("models--owner--model/blobs");
+            fs::create_dir_all(&blobs).unwrap();
+            fs::write(blobs.join("abc123.incomplete"), b"wei").unwrap();
+            let repo = hub(&origin, cache.path()).model("owner/model", "main");
+
+            let short = repo.get("model.bin");
+            assert!(matches!(short, Err(HubError::Io { .. })));
+            assert!(!blobs.join("abc123").exists());
+
+            let path = repo.get("model.bin").unwrap();
+
+            assert_eq!(fs::read(path).unwrap(), BODY);
+            assert_eq!(
+                storage_ranges(&requests),
+                [Some("bytes=3-".to_owned()), Some("bytes=5-".to_owned())]
             );
         }
 
